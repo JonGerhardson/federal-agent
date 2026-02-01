@@ -134,17 +134,21 @@ df["OBLIGATED_AMOUNT"] = df["OBLIGATED_AMOUNT"].replace(r'[$,]', '', regex=True)
 
 ## Common FPDS Parameters
 
+**DEPARTMENT_ID vs AGENCY_CODE:** In FPDS, `AGENCY_CODE` is a **sub-agency** code (e.g., ICE=7012, CBP=7014, Army=2100). `DEPARTMENT_ID` is the **top-level department** (e.g., DHS=7000, DoD=9700). Using `AGENCY_CODE="7000"` for "all DHS" returns **zero results** because 7000 is a department, not an agency. Use `DEPARTMENT_ID` for department-wide queries.
+
 ```python
-fpdsRequest(AGENCY_CODE="7504")                    # By 4-digit agency code
-fpdsRequest(AGENCY_NAME="Department of the Army")  # By name
-fpdsRequest(PIID="W52P1J24C0019")                  # Specific contract
+fpdsRequest(DEPARTMENT_ID="7000")                   # All DHS (all sub-agencies)
+fpdsRequest(AGENCY_CODE="7012")                     # ICE only
+fpdsRequest(AGENCY_CODE="7504")                     # By 4-digit sub-agency code
+fpdsRequest(AGENCY_NAME="Department of the Army")   # By name
+fpdsRequest(PIID="W52P1J24C0019")                   # Specific contract
 fpdsRequest(VENDOR_ADDRESS_STATE_CODE="CA")         # Vendor state
 fpdsRequest(LAST_MOD_DATE="[2024/01/01, 2024/12/31]")  # Date range
 fpdsRequest(PRINCIPAL_NAICS_CODE="541511")          # NAICS code
 fpdsRequest(PRODUCT_OR_SERVICE_CODE="R617")         # PSC code
 ```
 
-Key fields: PIID, AGENCY_NAME, AGENCY_CODE, OBLIGATED_AMOUNT, UEI_NAME, VENDOR_ADDRESS_STATE_NAME, PRINCIPAL_NAICS_CODE, PRODUCT_OR_SERVICE_CODE, SIGNED_DATE, DESCRIPTION_OF_REQUIREMENT, MODIFICATION_NUMBER
+Key fields: PIID, AGENCY_NAME, AGENCY_CODE, DEPARTMENT_ID, DEPARTMENT_NAME, OBLIGATED_AMOUNT, UEI_NAME, VENDOR_ADDRESS_STATE_NAME, PRINCIPAL_NAICS_CODE, PRODUCT_OR_SERVICE_CODE, SIGNED_DATE, DESCRIPTION_OF_REQUIREMENT, MODIFICATION_NUMBER
 
 The library validates 601 fields with regex patterns. For the full list, see the fpds library's `fields.json`.
 

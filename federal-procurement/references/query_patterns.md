@@ -2,7 +2,7 @@
 
 ## Table of Contents
 
-1. [FPDS Library Usage](#fpds-library-usage)
+1. [FPDS Library Usage](#fpds-library-usage) (includes [DEPARTMENT_ID vs AGENCY_CODE](#department-vs-agency-queries-department_id-vs-agency_code))
 2. [USAspending API Usage](#usaspending-api-usage)
 3. [SAM.gov Opportunities Queries](#samgov-opportunities-queries)
 4. [SAM.gov Entity Lookups](#samgov-entity-lookups)
@@ -59,10 +59,51 @@ Dates use `YYYY/MM/DD` format (forward slashes, not hyphens).
 - Exclusive range: `(2024/01/01, 2024/12/31)`
 - Mixed: `[2024/01/01, 2024/12/31)`
 
+### Department vs agency queries (DEPARTMENT_ID vs AGENCY_CODE)
+
+In FPDS, `AGENCY_CODE` refers to a **sub-agency** and `DEPARTMENT_ID` refers to the **top-level department**. Using `AGENCY_CODE` with a department-level code (e.g., 7000 for DHS, 9700 for DoD) returns **zero results**.
+
+```python
+# CORRECT: All DHS contracts (captures ICE, CBP, FEMA, etc.)
+fpdsRequest(DEPARTMENT_ID="7000", LAST_MOD_DATE="[2025/01/20, 2026/02/01]")
+
+# WRONG: Returns nothing — 7000 is a department, not an agency
+fpdsRequest(AGENCY_CODE="7000", LAST_MOD_DATE="[2025/01/20, 2026/02/01]")
+
+# CORRECT: Specific sub-agency only
+fpdsRequest(AGENCY_CODE="7012", ...)  # ICE only
+fpdsRequest(AGENCY_CODE="7014", ...)  # CBP only
+
+# CORRECT: All DoD
+fpdsRequest(DEPARTMENT_ID="9700", ...)
+
+# CORRECT: Specific DoD sub-agency
+fpdsRequest(AGENCY_CODE="2100", ...)  # Army
+fpdsRequest(AGENCY_CODE="1700", ...)  # Navy
+```
+
+**DHS sub-agency codes:**
+
+| Code | Agency |
+|------|--------|
+| 7001 | Office of Procurement Operations |
+| 7003 | USCIS |
+| 7004 | Office of Inspector General |
+| 7005 | CBP (note: also appears as 7014 in some records) |
+| 7008 | Coast Guard |
+| 7009 | Secret Service |
+| 7012 | ICE (contracting) |
+| 7013 | TSA |
+| 7014 | CBP |
+| 7015 | FLETC |
+| 7022 | FEMA |
+
+This same pattern applies to all cabinet-level departments: always use `DEPARTMENT_ID` for department-wide queries, `AGENCY_CODE` for specific sub-agencies.
+
 ### FPDS field list
 
 The library defines 601 fields. Common ones:
-- PIID, AGENCY_NAME, AGENCY_CODE, CONTRACTING_AGENCY_NAME
+- PIID, AGENCY_NAME, AGENCY_CODE, DEPARTMENT_ID, DEPARTMENT_NAME, CONTRACTING_AGENCY_NAME
 - OBLIGATED_AMOUNT, UEI_NAME, VENDOR_ADDRESS_STATE_NAME
 - PRINCIPAL_NAICS_CODE, PRODUCT_OR_SERVICE_CODE
 - SIGNED_DATE, AWARD_COMPLETION_DATE, DESCRIPTION_OF_REQUIREMENT

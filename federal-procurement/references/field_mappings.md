@@ -18,9 +18,9 @@ Complete mapping of FPDS ATOM feed field names to USAspending API parameters and
 
 | FPDS Field | USAspending API | Notes |
 |------------|-----------------|-------|
-| AGENCY_CODE | agencies.award_agency_code | 4-digit code |
+| AGENCY_CODE | agencies.award_agency_code | 4-digit **sub-agency** code (e.g., ICE=7012, CBP=7014). NOT for department-level queries — use DEPARTMENT_ID instead |
 | AGENCY_NAME | agencies.toptier_name | |
-| DEPARTMENT_ID | agencies.id | |
+| DEPARTMENT_ID | agencies.id | Top-level **department** code (e.g., DHS=7000, DoD=9700). Use this for department-wide queries |
 | DEPARTMENT_NAME | agencies.toptier_name | |
 | CONTRACTING_AGENCY_ID | agencies.id | |
 | CONTRACTING_AGENCY_NAME | agencies.name | |
