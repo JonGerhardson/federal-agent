@@ -1,0 +1,14 @@
+{
+  "source": "sam_extract_request",
+  "query_params": {
+    "api_key": "***REDACTED***",
+    "format": "JSON",
+    "includeSections": "entityRegistration,coreData",
+    "registrationStatus": "A"
+  },
+  "fetched_at": "2026-06-07T11:47:53Z",
+  "record_count": 1,
+  "data": {
+    "message": "Extract File will be available for download with url: https://api.sam.gov/entity-information/v3/download-entities?api_key=***REDACTED***&token=*** in some time. If you have requested for an email notification, you will receive it once the file is ready for download. Requests for Larger Set of Data may take longer time to process."
+  }
+}
