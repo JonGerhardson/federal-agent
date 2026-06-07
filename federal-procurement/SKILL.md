@@ -36,6 +36,11 @@ def save_api_response(source: str, params: dict, data, subdir: str = ""):
 
 Override save directory with `FPDS_DATA_DIR` env var. Default: `./data/raw/`.
 
+For importable use (e.g. inside the bulk SAM extract module), this same helper lives in
+[scripts/provenance.py](scripts/provenance.py) — `from scripts.provenance import save_api_response`.
+That module also provides `write_extract_manifest()` for large downloaded files (records the
+resolved URL, timestamp, record count, and sha256 in a sidecar instead of re-serializing the data).
+
 ## Data Sources
 
 Three primary sources for federal contract data:
@@ -43,8 +48,15 @@ Three primary sources for federal contract data:
 | Source | Best For | Access |
 |--------|----------|--------|
 | **FPDS ATOM Feed** | Transaction-level detail, modifications, specific PIIDs, recent data | `fpds` Python library |
-| **USAspending API** | Aggregations, fiscal year summaries, complex multi-criteria filters, keyword search | REST API (no auth) |
-| **SAM.gov APIs** | Contract opportunities/solicitations, entity registrations, org hierarchy | REST API (requires free API key) |
+| **USAspending API** | Aggregations, fiscal year summaries, complex multi-criteria filters, keyword search | REST API (no auth, **no rate limit**) |
+| **SAM.gov APIs** | Single-entity lookups, org hierarchy | REST API (free key, **10–1,000/day cap**) |
+| **SAM File Extracts** | **Bulk**: all entities, all open opportunities, the debarment (Exclusions) list, assistance programs | Daily flat files on a public S3 bucket (no cap) |
+
+**Routing (bulk vs API):** the SAM search APIs are capped at 10/day on a bare key, so for any **bulk
+or cross-reference** work use the **flat-file extracts** (entities via the async Extract API, the rest
+via `scripts/file_extracts.py`). **USAspending** has no cap → query its **API first** for awards
+(FPDS for transaction-level); its GB-scale bulk archive is a last resort. Everything joins on **UEI**.
+See [references/file_extracts.md](references/file_extracts.md).
 
 ## Quick Start
 
@@ -111,7 +123,38 @@ opps = resp.json().get("opportunitiesData", [])
 save_api_response("sam_opportunities", params, opps, subdir="sam")
 ```
 
-### SAM.gov Entity Lookup
+### SAM.gov Entity Extract (bulk — the default for any cross-reference work)
+
+Per-UEI lookups (below) are capped at 10/day (bare key) or 1,000/day (associated key). For
+**iterating over a corpus** — enriching award recipients, entity resolution, shell detection — use
+the asynchronous **Extract API** instead: adding `format` returns a downloadable file of up to the
+first 1,000,000 records (the active-registrant universe is well under that), so one job ≈ the whole
+public dataset and the daily cap stops mattering. The module handles submit → poll → download →
+unzip → load, caches the raw file, and writes a provenance manifest:
+
+```python
+from scripts.sam_extract import submit_extract, download_extract, enrich_ueis
+
+# Pull the WHOLE active-registrant universe in one job (it's under the 1M cap).
+# Quota-safe two-step (2 calls) — the right pattern on a 10/day key:
+submit_extract({"registrationStatus": "A"})         # 1 call: submit, token saved to disk
+# … wait a few minutes for SAM to build the file …
+df = download_extract({"registrationStatus": "A"})  # 1 call: grab finished file (cache + manifest)
+# → tidy table keyed on UEI: legal_business_name, uei, cage_code, physical_*,
+#   registration_date, activation_date, expiration_date, entity_start_date, …
+
+# Enrich a list of UEIs (e.g. from a USAspending pull): cache-first, live per-UEI only for misses
+enriched = enrich_ueis(award_df["recipient_uei"].dropna().tolist())
+```
+
+⚠️ **Every download poll counts against the daily cap.** A national file takes minutes to build, so
+the one-shot `pull_entity_extract` (which polls in a loop) can burn a bare 10/day key before the file
+is ready — use the two-step `submit_extract` → wait → `download_extract` instead (or a 1,000/day
+entity-associated key). Full async flow + filter params: [references/sam_api.md](references/sam_api.md).
+
+### SAM.gov Entity Lookup (single-entity / fallback)
+
+For one entity (or as the cache-miss fallback `enrich_ueis` uses), look up by UEI directly:
 
 ```python
 params = {
@@ -202,7 +245,12 @@ For FPDS, USAspending, and SAM.gov field mappings, read [references/field_mappin
 For full API endpoint reference, filter structure, award type codes, pagination, and response fields, read [references/usaspending_api.md](references/usaspending_api.md).
 
 ### SAM.gov API Details
-For SAM.gov Opportunities, Entity Management, and Federal Hierarchy API reference, read [references/sam_api.md](references/sam_api.md).
+For SAM.gov Opportunities, Entity Management, and Federal Hierarchy API reference, read [references/sam_api.md](references/sam_api.md). The **bulk Entity Extract** (default for cross-reference work) is documented there and implemented in `scripts/`.
+
+### Bundled Scripts (scripts/)
+- **[scripts/sam_extract.py](scripts/sam_extract.py)** — bulk SAM.gov Entity Extract. On a tight 10/day key use the two-step `submit_extract(filters)` (1 call, saves token) → wait → `download_extract(filters)` (1 call, caches the raw file under `references/data/sam_extract/` + writes a manifest, returns a normalized UEI-keyed DataFrame). `pull_entity_extract(filters)` is the one-shot poll-in-a-loop convenience (needs quota). `enrich_ueis(uei_list)` resolves attributes cache-first, falling back to the live per-UEI endpoint only for misses. Use this module for any bulk/cross-reference operation.
+- **[scripts/file_extracts.py](scripts/file_extracts.py)** — bulk flat-file extracts from SAM Data Services (the `falextracts` S3 bucket): `load_file_extract("contract_opportunities"|"exclusions"|"assistance_listings_datagov"|…)` downloads + caches + parses to a DataFrame; `check_exclusions(uei_list)` flags award winners on the debarment list (UEI join). Also `usaspending_award_archive(fy)` (last-resort GB bulk; prefer the API/FPDS). Public datasets (Opportunities, Assistance Listings) need no key; **Exclusions** auto-fetches via the IAE Extracts Download API when `SAM_API_KEY` is set (or pass a presigned URL); Entity → use the JSON Entity Extract API. Full reference: [references/file_extracts.md](references/file_extracts.md).
+- **[scripts/provenance.py](scripts/provenance.py)** — the shared `save_api_response()` helper (importable) plus `write_extract_manifest()` for large cached files.
 
 ### Query Patterns
 For detailed code examples covering FPDS queries, USAspending queries, SAM.gov queries, data cleanup, analysis, investigative patterns, and cross-source comparison, read [references/query_patterns.md](references/query_patterns.md).
