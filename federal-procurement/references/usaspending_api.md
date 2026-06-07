@@ -132,10 +132,12 @@ For the `award_type_codes` filter:
 
 ## Response Fields (spending_by_award)
 
+**Use `Recipient UEI`** as the join key to the SAM entity extract / Exclusions. `Recipient DUNS Number` is deprecated (DUNS was retired in favor of UEI) and is increasingly blank.
+
 Available fields for the `fields` parameter:
 
 ```
-"Award ID", "Recipient Name", "Recipient DUNS Number",
+"Award ID", "Recipient Name", "Recipient UEI", "Recipient DUNS Number",
 "Awarding Agency", "Awarding Sub Agency", "Award Amount",
 "Total Outlays", "Description", "Contract Award Type",
 "Award Type", "Funding Agency", "Funding Sub Agency",
@@ -166,9 +168,43 @@ while True:
 save_api_response("usaspending", payload.get("filters", {}), all_results)
 ```
 
+**⚠️ ~10,000-result ceiling.** `spending_by_award` caps page size at **100**, and you cannot page
+past roughly the **first 10,000 results** of any single query (a deep-pagination limit). This is
+*not* a rate limit (there's no key and no daily cap) — it's a per-query depth cap. If a filtered
+query would exceed ~10k awards, **subdivide the filter** (by agency, quarter, or amount band) and
+concatenate, or fall back to the bulk download below. For "large awards" work this rarely bites: a
+`> $1M` filter for one agency/quarter is well under 10k.
+
+## Bulk download (last resort)
+
+USAspending has **no key and no rate limit**, so the API above is almost always the right tool.
+Reach for the bulk award archive only to mirror a *whole* fiscal year/agency offline, or when a
+query exceeds the ~10k pagination ceiling and subdividing is impractical. For transaction-level
+detail, **FPDS** (the `fpds` library) is usually the better bulk source.
+
+Pre-generated annual archives are listed via:
+
+```
+GET /api/v2/bulk_download/list_monthly_files/?agency=all&fiscal_year=2025&type=contracts   # or type=assistance
+```
+
+which returns file URLs at `https://files.usaspending.gov/award_data_archive/FY{YYYY}_All_{Contracts|Assistance}_Full_{YYYYMMDD}.zip`.
+**These are big** — verified FY2025: contracts **1.91 GB**, assistance **1.48 GB** zipped (~10–20 GB
+raw each); all years/types ≈ hundreds of GB. The helper resolves the URL + size without downloading:
+
+```python
+from scripts.file_extracts import usaspending_award_archive
+info = usaspending_award_archive(2025, "contracts")        # {file_name, url, size_bytes} — no download
+# info = usaspending_award_archive(2025, "contracts", download=True)   # actually pull the ~2 GB zip
+```
+
+Per-agency archives (pass a specific `agency` id) are far smaller. There's also a custom async
+builder, `POST /api/v2/bulk_download/awards/` (submit → poll status → download), if you need a
+filtered slice as a file. See [file_extracts.md](file_extracts.md).
+
 ## Rate Limits
 
 No official rate limit documented, but:
 - Keep requests reasonable (1-2 per second)
-- Use pagination instead of massive single requests
+- Use pagination instead of massive single requests (mind the ~10k-result ceiling above)
 - Cache results when doing repeated analysis

@@ -431,6 +431,80 @@ psc_breakdown = df[df["AGENCY_NAME"] == "Department of Defense"].groupby(
 )["OBLIGATED_AMOUNT"].sum().sort_values(ascending=False).head(20)
 ```
 
+### Flag a recently-activated entity winning a large award (USAspending × SAM extract)
+
+A classic shell-company / pass-through tell: an entity that registered or *activated* in SAM.gov
+only weeks before it was awarded a large contract. USAspending carries the award amount + recipient
+UEI + address; the SAM extract carries the authoritative `registration_date` / `activation_date`.
+Join them on UEI and look for tiny gaps between activation and award.
+
+This is the canonical use of the **bulk extract**: you enrich a whole list of award UEIs from one
+cached extract instead of thousands of per-UEI calls.
+
+```python
+import requests, pandas as pd
+from scripts.provenance import save_api_response
+from scripts.sam_extract import submit_extract, download_extract, enrich_ueis
+
+# 1. Large contract awards from USAspending (award + recipient UEI + amount + date)
+payload = {
+    "filters": {
+        "time_period": [{"start_date": "2025-01-01", "end_date": "2025-12-31"}],
+        "award_type_codes": ["A", "B", "C", "D"],
+        "award_amounts": [{"lower_bound": 1_000_000}],
+    },
+    "fields": ["Award ID", "Recipient Name", "Recipient UEI", "Award Amount", "Start Date"],
+    "limit": 100, "sort": "Award Amount", "order": "desc",
+}
+resp = requests.post("https://api.usaspending.gov/api/v2/search/spending_by_award/", json=payload)
+awards = resp.json().get("results", [])
+save_api_response("usaspending_large_awards", payload["filters"], awards)
+awards_df = pd.DataFrame(awards)
+# "Recipient UEI" is the recipient's UEI; if your USAspending fields don't include it, source UEIs
+# from an FPDS pull (VENDOR_UEI) or resolve recipient_id via /api/v2/recipient/.
+awards_df = awards_df.rename(columns={"Recipient UEI": "uei", "Award Amount": "award_amount",
+                                      "Start Date": "award_date"})
+
+# 2. Seed the SAM extract cache once for the corpus (2 calls, quota-safe), then enrich cache-first.
+#    submit_extract({"registrationStatus": "A"})          # 1 call: all active registrants
+#    ...wait a few minutes...
+#    download_extract({"registrationStatus": "A"})        # 1 call: builds the cache
+# With the cache seeded, enrich_ueis serves the award UEIs with zero further calls (live-fallback
+# only for any UEI missing from the extract):
+sam = enrich_ueis(awards_df["uei"].dropna().tolist())   # tidy table keyed on uei
+
+# 3. Join and compute the recency tell
+merged = awards_df.merge(sam, on="uei", how="left")
+merged["award_date"] = pd.to_datetime(merged["award_date"], errors="coerce")
+merged["activation_date"] = pd.to_datetime(merged["activation_date"], errors="coerce")
+merged["days_active_before_award"] = (merged["award_date"] - merged["activation_date"]).dt.days
+
+# 4. Flag freshly-activated entities winning big — the smaller the gap, the louder the signal
+suspects = merged[(merged["days_active_before_award"].notna()) &
+                  (merged["days_active_before_award"] < 180) &
+                  (merged["award_amount"] >= 1_000_000)]
+print(suspects[["Recipient Name", "uei", "award_amount", "activation_date",
+                "award_date", "days_active_before_award", "physical_state"]]
+      .sort_values("days_active_before_award").to_string())
+
+# 5. Cross-check the winners against the SAM debarment (Exclusions) list — a freshly-activated
+#    entity tied to an *excluded* party (shared UEI, or shared address/name) is a loud red flag.
+from scripts.file_extracts import check_exclusions
+debarred = check_exclusions(awards_df["uei"].dropna().tolist())   # joins on UEI (firm exclusions)
+if not debarred.empty:
+    print("WINNERS ON THE EXCLUSIONS LIST:")
+    print(debarred[["Unique Entity ID", "Name", "Excluding Agency",
+                    "Exclusion Type", "Active Date", "Termination Date"]].to_string())
+# Compare Active Date/Termination Date to award_date to see if the party was excluded *when* it won.
+# Exclusions has UEI only for firms (~28%); individual exclusions need name-matching. The same UEI
+# can appear on multiple exclusion records (firm + DBA) — Cross-Reference links related parties.
+```
+
+Variations: pull the extract with an `activationDate=[MM/DD/YYYY,MM/DD/YYYY]` window to start from
+the freshly-activated set, then intersect with awards; group `suspects` by `physical_address_line1`
+to surface multiple shells sharing one address. Remember parent-hierarchy fields are FOUO-restricted
+for a public key, so corroborate ownership via shared address / officer names where available.
+
 ## Cross-Source Comparison
 
 ### Query same scope from both sources
@@ -477,7 +551,8 @@ Note: Record counts will differ — FPDS has transaction-level data (including m
 | Multi-criteria complex filters | USAspending |
 | Larger result sets | USAspending |
 | Keyword search across descriptions | USAspending |
-| Entity registration data (UEI, CAGE, business type) | SAM.gov Entity API |
+| Enrich/cross-reference a *list* of UEIs at scale | SAM.gov **Entity Extract** (bulk) — `pull_entity_extract` / `enrich_ueis`, not per-UEI loops |
+| Entity registration data (UEI, CAGE, business type) — single entity | SAM.gov Entity API (per-UEI) |
 | Active solicitations and notices | SAM.gov Opportunities API |
 | Verify contractor SAM registration status | SAM.gov Entity API |
 | Resolve agency/org names to IDs | SAM.gov Federal Hierarchy API |

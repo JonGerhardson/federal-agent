@@ -160,6 +160,11 @@ save_api_response("sam_opportunities_multiyear", {"range": "2022-2024"}, all_opp
 
 Look up SAM.gov entity registrations (contractors, grantees). Authoritative source for UEI, CAGE code, and registration status.
 
+> **Doing bulk work or cross-referencing a list of UEIs?** Don't loop this per-UEI endpoint — it's
+> capped at 10–1,000 requests/day. Use the **[Entity Extract API (bulk)](#entity-extract-api-bulk--the-default-for-bulk--cross-reference-work)**
+> below (one async job ≈ the whole public dataset). The per-UEI calls in this section are the
+> single-entity / cache-miss fallback.
+
 **Endpoint:** `GET https://api.sam.gov/entity-information/v3/entities`
 
 ### Parameters
@@ -175,7 +180,7 @@ Look up SAM.gov entity registrations (contractors, grantees). Authoritative sour
 | `purposeOfRegistrationCode` | string | `Z1` (federal assistance), `Z2` (contracts), `Z5` (both) |
 | `naicsCode` | string | NAICS code |
 | `primaryNaics` | string | Primary NAICS code (Y/N flag when combined with naicsCode) |
-| `stateCode` | string | 2-letter state code |
+| `stateCode` | string | 2-letter state code (per-UEI search; the **bulk extract** uses `physicalAddressProvinceOrStateCode` instead) |
 | `zipCode` | string | ZIP code |
 | `countryCode` | string | 3-letter country code |
 | `samExtractCode` | string | `A` (all), `E` (entity), `1`-`4` (specific extracts) |
@@ -290,6 +295,122 @@ def best_entity_match(name: str, entities: list, threshold: float = 0.6) -> dict
             best, best_score = e, score
     return best if best_score >= threshold else None
 ```
+
+## Entity Extract API (bulk) — the default for bulk / cross-reference work
+
+The per-UEI lookups above are rate-limited to **10 requests/day** (bare key) or **1,000/day**
+(entity-associated key) — far too few to iterate over a corpus of award recipients. The *same*
+Entity Management endpoint doubles as an asynchronous **Extract API**: add a `format` parameter and
+it returns a downloadable file of up to the **first 1,000,000 records**. The active-registrant
+universe is well under 1M, so one extract ≈ the entire public dataset. **Use the extract for any
+bulk or cross-reference operation; per-UEI lookups are now a single-entity / cache-miss fallback.**
+
+Don't hand-roll the async dance — call the module. **Pull the whole active-registrant universe in
+one job** (it's under the 1M cap), then enrich from that cache:
+
+```python
+from scripts.sam_extract import submit_extract, download_extract, pull_entity_extract, enrich_ueis
+
+# QUOTA-SAFE two-step (recommended for the national pull on a 10/day key) — 2 calls total:
+submit_extract({"registrationStatus": "A"})          # 1 call: submit ALL active registrants, token saved
+# … wait a few minutes for SAM to build the file (or until the optional email notification) …
+df = download_extract({"registrationStatus": "A"})   # 1 call: grab the finished file, cache + manifest
+
+# One-shot convenience (submits AND polls in a loop — only when you have quota to spare):
+df = pull_entity_extract({"registrationStatus": "A", "physicalAddressProvinceOrStateCode": "VT"})
+
+# Enrich a list of UEIs (e.g. from USAspending) — cache-first, live per-UEI only for misses
+enriched = enrich_ueis(["ABC123DEF456", "GHI789JKL012"])
+```
+
+One national extract (~600–700k active entities, well under 1M) replaces the entire per-UEI grind,
+and `enrich_ueis` then serves your award UEIs straight from that cached file with zero further calls.
+
+### The async flow (verified live against api.sam.gov, 2026-06)
+
+The GSA docs describe this imperfectly; the steps below are what the API **actually does**:
+
+1. **Submit** — `GET /entity-information/v3/entities` with `format=JSON` (or `CSV`) plus your
+   filters. Returns HTTP 200 with a **plain-text** body (not a JSON object) carrying a token:
+
+   ```
+   Extract File will be available for download with url:
+   https://api.sam.gov/entity-information/v3/download-entities?api_key=…&token=zJktKnaazg in some time.
+   ```
+
+2. **Poll/download** — **`GET`** the download URL (`download-entities?api_key=…&token=<token>`).
+   ⚠️ The endpoint is **GET**, not POST — a POST returns `415 UNSUPPORTED_MEDIA_TYPE`.
+   - **Still generating:** HTTP `400` — `{"message":"The requested JSON or CSV file is not generated yet. Please try again later."}`
+   - **Ready:** HTTP `200` with the binary file. **Verified live (2026-06-07):** a `format=JSON` public extract downloads as a **bare gzip stream** (`.gz`, magic `1f 8b`) that decompresses directly to a JSON array — *not* a `.zip`. (GSA's docs describe a `.zip` of `.json.gz`/`.csv.gz` members; CSV exports or federal keys may differ.) The module sniffs the magic bytes (`PK`=zip, `1f 8b`=gzip, else plain) and decompresses whichever it gets, so it's robust to both.
+   - **Expired token:** HTTP `400` — `"…token is expired."`
+   - **Over the cap:** HTTP `400` — `"Total Number of Records: <n> exceeded the maximum allowable limit: 1000000…"`
+
+3. **Cache + provenance** — the raw download is saved to
+   `references/data/sam_extract/sam_entities_<filter-hash>_<YYYYMMDD>.<ext>` and reused unless older
+   than `refresh_after_days` (default 7). A manifest sidecar (`…manifest.json`) records the resolved
+   URL, params, timestamp, record count, and sha256.
+
+**Verified end-to-end (2026-06-07):** a national `{"registrationStatus": "A"}` extract returned a
+137 MB gzip → **750,756 records** (744,227 rows after dropping null/duplicate UEIs), in **4 API
+calls total** (1 submit + 3 download attempts, since the file took ~25 min to build). The file took
+a while to generate — hence submit/wait/download, not a tight poll loop.
+
+### ⚠️ Every poll counts against the daily cap — use submit/download, not a poll loop
+
+Each download poll is a billable request. A bare **10/day** key is genuinely tight: a national file
+takes minutes to build, so a naive `pull_entity_extract` poll loop can spend the whole day's quota
+*before the file is even ready*, after which you get `429 code 900804 "Message throttled out"` with
+`Retry-After` / `nextAccessTime` pointing at the **next 00:00 UTC** (the daily reset).
+
+The fix is to **decouple submit from download** so the whole national pull costs **2 calls**:
+
+1. `submit_extract(filters)` — one call; SAM returns a token (the module saves it to disk).
+2. Wait for the file to finish building (minutes; SAM can also email a notification).
+3. `download_extract(filters)` — one call; resolves the saved token and grabs the finished file.
+
+`pull_entity_extract` (which polls in a loop) is fine on a 1,000/day entity-associated key or for a
+small slice that builds quickly, but on a 10/day key prefer the two-step path. The whole point of
+the extract is that *one* job replaces thousands of per-UEI calls — if you're tripping the cap, look
+for a per-UEI loop that should be `enrich_ueis()`.
+
+### Extract filter parameters (verified, case-sensitive)
+
+| Parameter | Notes |
+|-----------|-------|
+| `format` | `JSON` or `CSV` — presence switches the endpoint into async extract mode |
+| `registrationStatus` | `A` (active), `E` (expired) |
+| `registrationDate` | Single `MM/DD/YYYY` or inclusive range `[MM/DD/YYYY,MM/DD/YYYY]` |
+| `activationDate` | Same format — **the tell for freshly-activated entities** |
+| `registrationExpirationDate` | Same format (was `expirationDate` in v1) |
+| `physicalAddressProvinceOrStateCode` | 2-char state/territory code — **this is the geo filter for the extract** (not `stateCode`) |
+| `primaryNaics` / `naicsCode` | 6-digit NAICS |
+| `q` | Free-text search |
+| `ueiSAM` / `cageCode` | Up to 100 values each |
+| `includeSections` | `entityRegistration`, `coreData`, `assertions`, `pointsOfContact`, `repsAndCerts`, `All`, `integrityInformation` |
+
+**includeSections for a non-federal "Read Public" key:** you get name / UEI / CAGE / registration
+dates / physical & mailing addresses / business types / NAICS / PSC and POC *name + address*.
+Entity **parent/child hierarchy**, security levels, and POC **email/phone/fax** are FOUO-restricted
+and require a federal "Read FOUO" key — those fields are absent for a public key, so a parent-
+hierarchy column will usually be empty. The module defaults to `entityRegistration,coreData`
+(everything needed for entity resolution / shell detection); add `assertions` for NAICS/PSC.
+
+### Handling the 1,000,000-record cap
+
+Active registrants total well under 1M, so a single `registrationStatus=A` extract fits. If a
+broader filter set ever exceeds the cap (the 400 above), `pull_entity_extract` auto-partitions by
+`physicalAddressProvinceOrStateCode` (every entity has a physical state, yielding ~56 sub-1M
+buckets), pulls each, and concatenates + de-dupes on UEI. For an extreme single state, narrow
+further with a `registrationDate` window.
+
+### Other bulk datasets: SAM File Extracts
+
+SAM also publishes **Contract Opportunities, Exclusions (debarment), and Assistance Listings** as
+daily flat files on a public S3 bucket — the bulk path that sidesteps the 10/day API cap for those
+datasets (just as the Entity Extract above does for entities). The entity *monthly* ZIP exists there
+too, but the JSON Entity Extract API above is preferred (cleaner, normalized). Full details — URL
+patterns, public-vs-presigned access, schemas, and the `scripts/file_extracts.py` loader (incl. a
+debarment cross-check) — are in **[file_extracts.md](file_extracts.md)**.
 
 ## Federal Hierarchy API
 
